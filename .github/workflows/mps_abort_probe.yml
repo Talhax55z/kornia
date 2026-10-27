@@ -1,0 +1,157 @@
+name: MPS abort probe (manual)
+
+# Finds what aborts a pytest process on the virtualized Apple GPU of a GitHub-hosted macOS runner (#4204).
+#
+# tests/geometry/test_ransac.py is skipped on MPS (`mps_process_abort`) because running it once ended in
+# `Fatal Python error: Aborted`, at a site that moved between runs. Whether that still happens on current main is
+# open: #4455 (SVD above 8192 elements on the CPU), #4528 (the essential solver's eigenvalues on the host) and the
+# new five-point solver all changed the code that was suspected. Nobody can answer it from a laptop, because a real
+# Apple GPU does not abort, so this workflow answers it on the runner.
+#
+# It runs .github/scripts/mps_abort_probe.py, which (1) runs the whole target in one process the way the abort used
+# to happen, (2) runs every test class in a fresh process, (3) runs every test of an aborting class on its own, and
+# (4) when the whole-target run aborted, delta-debugs the tests before the abort down to a small set that still
+# aborts. The verdict is in the job summary; one log per process is in the artifact.
+#
+# Manual only, and never part of the gate: it spawns dozens of pytest processes and exists to produce evidence.
+# Run it on a fork's Actions tab or on kornia/kornia. The environment steps mirror tests.yml (pinned torch channel)
+# so the probe sees the same wheels, image and Python as the MPS gate; keep them in step if tests.yml changes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner image. macos-15 is the MPS gate's image; macos-26 is where the abort was first seen.
+        type: choice
+        options: [macos-15, macos-26]
+        default: macos-15
+      target:
+        description: Test file or directory to search
+        type: string
+        default: tests/geometry/test_ransac.py
+      repeat:
+        description: Whole-target runs, and tries per minimization step (the abort is flaky; more is surer)
+        type: string
+        default: "3"
+      isolate-all:
+        description: Run every test of the target alone, not only those of aborting classes
+        type: boolean
+        default: false
+      pytorch-version:
+        description: Exact torch version to install
+        type: string
+        default: 2.14.0
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 120
+    env:
+      PIXI_ENV: py313
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.40.0
+          cache: true
+          environments: ${{ env.PIXI_ENV }}
+
+      - name: Install dependencies
+        run: pixi run -e "$PIXI_ENV" install
+
+      - name: Install the pinned torch and reconcile the environment
+        shell: bash
+        env:
+          PYTORCH_VERSION: ${{ inputs.pytorch-version }}
+        run: |
+          pixi run -e "$PIXI_ENV" uv run --no-sync uv pip install \
+            --reinstall-package torch --index-url https://download.pytorch.org/whl/cpu "torch==$PYTORCH_VERSION"
+          # Same sidecar reconciliation as tests.yml (#4199); check_torch_env.py carries the explanation.
+          report=$(pixi run -e "$PIXI_ENV" uv run --no-sync \
+            python .github/scripts/check_torch_env.py --list-undeclared-sidecars | tr -d '\r')
+          if ! printf '%s\n' "$report" | grep -q '^undeclared-sidecars:'; then
+            echo "the sidecar check reported no result; refusing to assume the venv is clean" >&2
+            printf '%s\n' "$report" >&2
+            exit 1
+          fi
+          stale=$(printf '%s\n' "$report" | sed -n 's/^undeclared-sidecars:[[:space:]]*//p' | tail -n 1)
+          if [[ -n "$stale" ]]; then
+            pixi run -e "$PIXI_ENV" uv run --no-sync uv pip uninstall $stale
+          fi
+
+      - name: Verify PyTorch version
+        shell: bash
+        env:
+          EXPECTED_PYTORCH_VERSION: ${{ inputs.pytorch-version }}
+        run: |
+          resolved=$(pixi run -e "$PIXI_ENV" uv run --no-sync \
+            python .github/scripts/check_torch_env.py --channel pinned --expected "$EXPECTED_PYTORCH_VERSION" \
+            | tr -d '\r' | sed -n 's/^torch-version: //p' | tail -n 1)
+          if [[ -z "$resolved" ]]; then
+            echo "the environment check did not report a torch version" >&2
+            exit 1
+          fi
+          echo "resolved=$resolved"
+
+      # A runner without Metal would make every MPS test skip and the probe report CLEAN for nothing.
+      - name: Verify MPS device and describe the runner
+        id: runner
+        shell: bash
+        env:
+          RUNNER_IMAGE: ${{ inputs.os }}
+        run: |
+          pixi run -e "$PIXI_ENV" uv run --no-sync python -c 'import torch; assert torch.backends.mps.is_available(), "MPS device not available on this runner"; x = torch.ones(2, device="mps"); assert (x + x).sum().item() == 4.0; print("MPS ok:", torch.mps.recommended_max_memory() // 2**20, "MiB recommended max memory")'
+          gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | sed -n 's/^ *Chipset Model: //p' | head -n 1)
+          torch_version=$(pixi run -e "$PIXI_ENV" uv run --no-sync python -c 'import torch; print(torch.__version__)' | tail -n 1)
+          echo "info=${RUNNER_IMAGE}, macOS $(sw_vers -productVersion), ${gpu:-unknown GPU}, torch ${torch_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Search for the abort
+        shell: bash
+        env:
+          # The configuration of the MPS gate: one device, one dtype, no CPU fallback, one thread.
+          KORNIA_TEST_DEVICE: mps
+          KORNIA_TEST_DTYPE: float32
+          KORNIA_TEST_RUNSLOW: "false"
+          MKL_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          UV_NO_SYNC: "1"
+          TARGET: ${{ inputs.target }}
+          REPEAT: ${{ inputs.repeat }}
+          ISOLATE_ALL: ${{ inputs.isolate-all }}
+          RUNNER_INFO: ${{ steps.runner.outputs.info }}
+        run: |
+          extra=()
+          if [[ "$ISOLATE_ALL" == "true" ]]; then
+            extra+=(--isolate-all)
+          fi
+          pixi run -e "$PIXI_ENV" uv run --no-sync python .github/scripts/mps_abort_probe.py \
+            --target "$TARGET" --repeat "$REPEAT" --time-budget 5400 \
+            --summary probe-summary.md --json probe-result.json --log-dir probe-logs \
+            --torch-info "$RUNNER_INFO" "${extra[@]}"
+
+      - name: Publish the verdict
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f probe-summary.md ]]; then
+            cat probe-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The probe wrote no summary; see the Search for the abort step." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mps-abort-probe-${{ inputs.os }}
+          path: |
+            probe-summary.md
+            probe-result.json
+            probe-logs/
+          if-no-files-found: warn
